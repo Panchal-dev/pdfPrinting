@@ -1,27 +1,41 @@
 #!/usr/bin/env python3
 """
-PDF Interleave + Rotate Left + 2-Up A4 Composer — Web Edition
-=============================================================
+PDF Interleave + Rotate + 2-Up Composer — Web Edition
+=====================================================
 
 Single-file FastAPI application that exposes the PDF pipeline
-(interleave A1,B1,A2,B2… → rotate 90° counter-clockwise → 2-up A4-landscape)
-as a browser-based upload/download tool with a dark Tailwind UI.
+(interleave A1,B1,A2,B2… → rotate → N-up sheet) as a browser-based
+upload/download tool with a dark Tailwind UI and an **Advanced Settings**
+panel that controls every stage of the pipeline.
 
 Architecture
 ------------
   • The core PDF transformation is a pure function on bytes, fully
     decoupled from the HTTP layer, so it stays unit-testable and could be
     reused by a CLI or worker without modification.
-  • The HTTP layer (FastAPI) handles multipart upload, size caps, path
-    sanitisation, and response streaming.
+  • The HTTP layer (FastAPI) handles multipart upload, form parsing,
+    size caps, path sanitisation, and response streaming.
   • The presentation layer is one inline HTML document using Tailwind CSS
     (CDN) with a dark-first palette. No build step, no Node toolchain.
+
+Quality / compression notes
+---------------------------
+  • Embedded images and fonts inside cloned pages are reused **by object
+    reference** — pypdf never re-encodes them, so pixel data survives
+    byte-for-byte.
+  • ``output_compression`` lets you pick the strategy for page content
+    streams:
+        - ``preserve`` (default): keep whatever filters were present.
+        - ``deflate``: force lossless FlateDecode (smaller files).
+        - ``none``: fully **uncompressed** streams (largest files,
+          readable without any decompression).
+  • ``allow_upscale=False`` (default) prevents blurry enlargements of
+    small source pages — a common edge case.
 
 Pipeline invariants
 -------------------
   • ``copy.copy`` precedes every ``rotate`` because ``PageObject.rotate``
-    mutates the page in place; cloning first keeps A- and B-copies
-    independent.
+    mutates the page in place; cloning first keeps copies independent.
   • All file bytes live in memory (``BytesIO``); nothing touches disk.
   • Uploaded filenames are reduced to their basename (defeating ``../``
     traversal) before use; the server never trusts them for paths.
@@ -46,29 +60,70 @@ import os
 import socket
 import sys
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import PurePosixPath
-from typing import Annotated, Final, Sequence
+from typing import Annotated, Any, Final, Mapping, Sequence
 
 import starlette.status as _http_status
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, Response
 from pypdf import PageObject, PdfReader, PdfWriter, Transformation
+from pypdf.generic import NameObject
 from starlette.concurrency import run_in_threadpool
 
 
 # ═════════════════════════════════ Constants ═════════════════════════════
 
-# ── A4 geometry (PDF points; 1 pt = 1/72 inch) ───────────────────────────
-A4_SHORT_SIDE_PT: Final[float] = 595.276
-A4_LONG_SIDE_PT: Final[float] = 841.890
-A4_LANDSCAPE_WIDTH_PT: Final[float] = A4_LONG_SIDE_PT
-A4_LANDSCAPE_HEIGHT_PT: Final[float] = A4_SHORT_SIDE_PT
+# ── Unit conversion (PDF points; 1 pt = 1/72 inch; 1 in = 25.4 mm) ───────
+PT_PER_INCH: Final[float] = 72.0
+MM_PER_INCH: Final[float] = 25.4
 
-# ── Layout ───────────────────────────────────────────────────────────────
-PAGES_PER_SHEET: Final[int] = 2
-ROTATION_DEGREES_LEFT: Final[int] = -90
+# ── Sheet geometry (PDF points, portrait) ────────────────────────────────
+# Reference: ISO 216 (A-series) and ANSI/Letter/Legal/Tabloid.
+SHEET_SIZES_PORTRAIT_PT: Final[dict[str, tuple[float, float]]] = {
+    "A5":      (419.528, 595.276),
+    "A4":      (595.276, 841.890),
+    "A3":      (841.890, 1190.551),
+    "LETTER":  (612.0,   792.0),
+    "LEGAL":   (612.0,  1008.0),
+    "TABLOID": (792.0,  1224.0),
+}
+DEFAULT_SHEET_SIZE: Final[str] = "A4"
+
+# ── Rotation ─────────────────────────────────────────────────────────────
+# Value → pypdf rotate() argument (degrees; negative = counter-clockwise).
+ROTATION_BY_NAME: Final[dict[str, int]] = {
+    "left":  -90,
+    "right":  90,
+    "180":   180,
+    "none":    0,
+}
+DEFAULT_ROTATION: Final[str] = "left"
+
+# ── Orientation ──────────────────────────────────────────────────────────
+ORIENTATION_CHOICES: Final[frozenset[str]] = frozenset(
+    {"portrait", "landscape", "auto"}
+)
+DEFAULT_ORIENTATION: Final[str] = "landscape"
+
+# ── Fit mode ─────────────────────────────────────────────────────────────
+FIT_MODE_CHOICES: Final[frozenset[str]] = frozenset(
+    {"fit", "stretch", "actual"}
+)
+DEFAULT_FIT_MODE: Final[str] = "fit"
+
+# ── Output stream compression ────────────────────────────────────────────
+COMPRESSION_CHOICES: Final[frozenset[str]] = frozenset(
+    {"preserve", "deflate", "none"}
+)
+DEFAULT_COMPRESSION: Final[str] = "preserve"
+
+# ── Layout constraints ───────────────────────────────────────────────────
+SUPPORTED_PAGES_PER_SHEET: Final[frozenset[int]] = frozenset({1, 2, 4})
+DEFAULT_PAGES_PER_SHEET: Final[int] = 2
+MAX_MARGIN_MM: Final[float] = 25.0
+MAX_GUTTER_MM: Final[float] = 25.0
 
 # ── Upload limits ────────────────────────────────────────────────────────
 MAX_UPLOAD_BYTES: Final[int] = 100 * 1024 * 1024        # 100 MiB per file
@@ -133,6 +188,32 @@ ERR_PORT_RANGE: Final[str] = "PORT out of range: {port}"
 # ═════════════════════════════════ Types ═════════════════════════════════
 
 @dataclass(frozen=True)
+class ComposerSettings:
+    """
+    Immutable container for every tunable in the pipeline.
+
+    Instantiate via :func:`build_settings` so raw, untrusted form values
+    are always coerced and clamped before reaching the pipeline.
+    """
+
+    rotation: str = DEFAULT_ROTATION
+    interleave: bool = True
+    pages_per_sheet: int = DEFAULT_PAGES_PER_SHEET
+    sheet_size: str = DEFAULT_SHEET_SIZE
+    sheet_orientation: str = DEFAULT_ORIENTATION
+    fit_mode: str = DEFAULT_FIT_MODE
+    margin_mm: float = 0.0
+    gutter_mm: float = 0.0
+    allow_upscale: bool = False
+    output_compression: str = DEFAULT_COMPRESSION
+    preserve_metadata: bool = True
+
+    @property
+    def rotation_degrees(self) -> int:
+        return ROTATION_BY_NAME[self.rotation]
+
+
+@dataclass(frozen=True)
 class ProcessedPdf:
     """Result of processing one uploaded PDF."""
 
@@ -150,33 +231,206 @@ class BatchResult:
     failures: tuple[str, ...]
 
 
+# ═════════════════════════════ Settings validation ═══════════════════════
+
+def _parse_bool(value: Any, default: bool) -> bool:
+    """Accept common truthy/falsey strings coming from HTML forms."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_float(
+    value: Any, default: float, low: float, high: float
+) -> float:
+    """Coerce to float and clamp to ``[low, high]``; fall back on failure."""
+    if value is None or value == "":
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed != parsed or parsed in (float("inf"), float("-inf")):
+        return default
+    return max(low, min(high, parsed))
+
+
+def _canonical_choice(
+    value: Any, choices: Mapping[str, Any] | frozenset[str], default: str
+) -> str:
+    """Return the lower-cased value iff it is a member of ``choices``."""
+    if value is None:
+        return default
+    candidate = str(value).strip().lower()
+    if candidate in choices:
+        return candidate
+    return default
+
+
+def _parse_pages_per_sheet(value: Any, default: int) -> int:
+    """Accept only the small set of layouts the grid builder supports."""
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed in SUPPORTED_PAGES_PER_SHEET else default
+
+
+def build_settings(raw: Mapping[str, Any]) -> ComposerSettings:
+    """
+    Build a validated :class:`ComposerSettings` from a raw mapping.
+
+    Missing, malformed, or out-of-range values fall back to documented
+    safe defaults so a single bad form field never aborts the request.
+    """
+    defaults = ComposerSettings()
+    return ComposerSettings(
+        rotation=_canonical_choice(
+            raw.get("rotation"), ROTATION_BY_NAME, defaults.rotation
+        ),
+        interleave=_parse_bool(raw.get("interleave"), defaults.interleave),
+        pages_per_sheet=_parse_pages_per_sheet(
+            raw.get("pages_per_sheet"), defaults.pages_per_sheet
+        ),
+        sheet_size=_canonical_choice(
+            raw.get("sheet_size"), SHEET_SIZES_PORTRAIT_PT, defaults.sheet_size
+        ),
+        sheet_orientation=_canonical_choice(
+            raw.get("sheet_orientation"),
+            ORIENTATION_CHOICES,
+            defaults.sheet_orientation,
+        ),
+        fit_mode=_canonical_choice(
+            raw.get("fit_mode"), FIT_MODE_CHOICES, defaults.fit_mode
+        ),
+        margin_mm=_parse_float(
+            raw.get("margin_mm"), defaults.margin_mm, 0.0, MAX_MARGIN_MM
+        ),
+        gutter_mm=_parse_float(
+            raw.get("gutter_mm"), defaults.gutter_mm, 0.0, MAX_GUTTER_MM
+        ),
+        allow_upscale=_parse_bool(
+            raw.get("allow_upscale"), defaults.allow_upscale
+        ),
+        output_compression=_canonical_choice(
+            raw.get("output_compression"),
+            COMPRESSION_CHOICES,
+            defaults.output_compression,
+        ),
+        preserve_metadata=_parse_bool(
+            raw.get("preserve_metadata"), defaults.preserve_metadata
+        ),
+    )
+
+
 # ═════════════════════════════════ PDF pipeline ══════════════════════════
 
-def _interleave_and_rotate(
+def _mm_to_pt(millimetres: float) -> float:
+    """Convert millimetres to PDF points."""
+    return millimetres * PT_PER_INCH / MM_PER_INCH
+
+
+def _grid_columns_rows(
+    pages_per_sheet: int, sheet_w: float, sheet_h: float
+) -> tuple[int, int]:
+    """
+    Return ``(columns, rows)`` for the requested pages-per-sheet count.
+
+    Orientation-aware: a landscape sheet prefers side-by-side layout,
+    while a portrait sheet prefers a vertical stack.
+    """
+    if pages_per_sheet == 1:
+        return 1, 1
+    if pages_per_sheet == 2:
+        return (2, 1) if sheet_w >= sheet_h else (1, 2)
+    if pages_per_sheet == 4:
+        return 2, 2
+    raise ValueError(f"Unsupported pages_per_sheet: {pages_per_sheet}")
+
+
+def _resolve_sheet_size(settings: ComposerSettings) -> tuple[float, float]:
+    """Return the effective ``(width, height)`` in points for a sheet."""
+    base_w, base_h = SHEET_SIZES_PORTRAIT_PT[settings.sheet_size]
+
+    orientation = settings.sheet_orientation
+    if orientation == "auto":
+        # Landscape when the natural layout is wider than it is tall.
+        orientation = "landscape" if base_h > base_w else "portrait"
+
+    if orientation == "landscape":
+        # Ensure the long edge is horizontal.
+        return (base_h, base_w) if base_h > base_w else (base_w, base_h)
+    # Portrait: ensure the long edge is vertical.
+    return (base_w, base_h) if base_h >= base_w else (base_h, base_w)
+
+
+def _arrange_pages(
     source_pages: Sequence[PageObject],
+    settings: ComposerSettings,
 ) -> list[PageObject]:
     """
-    Return ``[A1, B1, A2, B2, …]`` where each ``Xi`` is an independent
-    copy of the source page, rotated 90° counter-clockwise.
+    Produce the flat list of (cloned, optionally rotated) pages that will
+    be laid out on the sheets.
 
-    ``copy.copy`` must precede ``rotate`` because ``rotate`` mutates the
-    page in place; cloning first keeps the A- and B-copies independent.
+    ``interleave=True`` preserves the original behaviour: every source
+    page is duplicated ``pages_per_sheet`` times so the same page can be
+    placed in every slot of its sheet.  ``interleave=False`` emits each
+    page exactly once, so successive distinct pages share a sheet.
     """
-    interleaved: list[PageObject] = []
+    rotation = settings.rotation_degrees
+    copies_per_page = settings.pages_per_sheet if settings.interleave else 1
+
+    arranged: list[PageObject] = []
     for page in source_pages:
-        for _ in range(PAGES_PER_SHEET):
+        for _ in range(copies_per_page):
+            # copy.copy must precede rotate: rotate() mutates in place.
             clone = copy.copy(page)
-            interleaved.append(clone.rotate(ROTATION_DEGREES_LEFT))
-    return interleaved
+            if rotation:
+                clone.rotate(rotation)
+            arranged.append(clone)
+    return arranged
 
 
 def _fit_scale(
-    src_w: float, src_h: float, slot_w: float, slot_h: float
+    src_w: float,
+    src_h: float,
+    slot_w: float,
+    slot_h: float,
+    allow_upscale: bool,
 ) -> float:
-    """Uniform, aspect-preserving scale that fits the source into the slot."""
+    """
+    Uniform, aspect-preserving scale that fits the source into the slot.
+
+    When ``allow_upscale`` is False, the scale is additionally capped at
+    1.0 so small source pages are never enlarged (which would blur raster
+    content); they are simply centred in the slot instead.
+    """
     if src_w <= 0.0 or src_h <= 0.0:
         return 1.0
-    return min(slot_w / src_w, slot_h / src_h)
+    scale = min(slot_w / src_w, slot_h / src_h)
+    if not allow_upscale:
+        scale = min(scale, 1.0)
+    return scale
+
+
+def _compute_scale(
+    src_w: float, src_h: float, slot_w: float, slot_h: float,
+    settings: ComposerSettings,
+) -> tuple[float, float]:
+    """Return the (scale_x, scale_y) pair for the chosen fit mode."""
+    if settings.fit_mode == "actual":
+        return 1.0, 1.0
+    if settings.fit_mode == "stretch":
+        sx = slot_w / src_w if src_w > 0 else 1.0
+        sy = slot_h / src_h if src_h > 0 else 1.0
+        return sx, sy
+    # "fit" — uniform, aspect-preserving.
+    scale = _fit_scale(src_w, src_h, slot_w, slot_h, settings.allow_upscale)
+    return scale, scale
 
 
 def _place_page(
@@ -186,52 +440,175 @@ def _place_page(
     slot_h: float,
     x0: float,
     y0: float,
+    settings: ComposerSettings,
 ) -> None:
-    """Scale and centre ``page`` inside the slot whose bottom-left is (x0, y0)."""
+    """
+    Scale and centre ``page`` inside the slot whose bottom-left is ``(x0, y0)``.
+
+    Embedded images and fonts are referenced, not re-encoded, so no
+    pixel-level degradation occurs here.
+    """
     src_w = float(page.mediabox.width)
     src_h = float(page.mediabox.height)
 
-    scale = _fit_scale(src_w, src_h, slot_w, slot_h)
-    new_w = src_w * scale
-    new_h = src_h * scale
+    scale_x, scale_y = _compute_scale(src_w, src_h, slot_w, slot_h, settings)
+    new_w = src_w * scale_x
+    new_h = src_h * scale_y
 
     translate_x = x0 + (slot_w - new_w) / 2
     translate_y = y0 + (slot_h - new_h) / 2
 
     sheet.merge_transformed_page(
         page,
-        Transformation().scale(scale).translate(translate_x, translate_y),
+        Transformation()
+        .scale(scale_x, scale_y)
+        .translate(translate_x, translate_y),
     )
 
 
-def _compose_2up(pages: Sequence[PageObject]) -> tuple[PdfWriter, int]:
-    """Compose interleaved pages into 2-up A4-landscape sheets."""
-    sheet_w = A4_LANDSCAPE_WIDTH_PT
-    sheet_h = A4_LANDSCAPE_HEIGHT_PT
-    slot_w = sheet_w / PAGES_PER_SHEET
-    slot_h = sheet_h
-    left_x = 0.0
-    right_x = slot_w
-    bottom_y = 0.0
+def _compose_sheets(
+    pages: Sequence[PageObject], settings: ComposerSettings
+) -> tuple[PdfWriter, int]:
+    """
+    Compose ``pages`` into multi-up sheets according to ``settings``.
+
+    Returns the populated writer and the number of sheets produced.
+    """
+    sheet_w, sheet_h = _resolve_sheet_size(settings)
+    columns, rows = _grid_columns_rows(
+        settings.pages_per_sheet, sheet_w, sheet_h
+    )
+    pages_per_sheet = columns * rows
+
+    margin_pt = _mm_to_pt(settings.margin_mm)
+    gutter_pt = _mm_to_pt(settings.gutter_mm)
+
+    inner_w = sheet_w - 2 * margin_pt
+    inner_h = sheet_h - 2 * margin_pt
+
+    # Guard against user-supplied margins that would collapse the canvas.
+    if inner_w <= 0 or inner_h <= 0:
+        margin_pt = 0.0
+        gutter_pt = 0.0
+        inner_w = sheet_w
+        inner_h = sheet_h
+
+    slot_w = (inner_w - (columns - 1) * gutter_pt) / columns
+    slot_h = (inner_h - (rows - 1) * gutter_pt) / rows
 
     writer = PdfWriter()
     n_pages = len(pages)
     n_sheets = 0
 
-    for start in range(0, n_pages, PAGES_PER_SHEET):
+    for start in range(0, n_pages, pages_per_sheet):
         sheet = PageObject.create_blank_page(width=sheet_w, height=sheet_h)
-        _place_page(sheet, pages[start], slot_w, slot_h, left_x, bottom_y)
-        if start + 1 < n_pages:
-            _place_page(
-                sheet, pages[start + 1], slot_w, slot_h, right_x, bottom_y
+        chunk = pages[start : start + pages_per_sheet]
+
+        for index, page in enumerate(chunk):
+            col = index % columns
+            row = index // columns
+
+            x0 = margin_pt + col * (slot_w + gutter_pt)
+            # Layout is top-to-bottom, but PDF origin is bottom-left.
+            y0 = (
+                sheet_h
+                - margin_pt
+                - row * (slot_h + gutter_pt)
+                - slot_h
             )
+            _place_page(sheet, page, slot_w, slot_h, x0, y0, settings)
+
         writer.add_page(sheet)
         n_sheets += 1
 
     return writer, n_sheets
 
 
-def process_pdf_bytes(pdf_bytes: bytes, stem: str) -> ProcessedPdf:
+def _reencode_stream(
+    stream_obj: Any, target_filter: str | None
+) -> None:
+    """
+    Rewrite a single stream's bytes with the requested /Filter.
+
+    ``target_filter=None`` means "no filter" (uncompressed).  Failures are
+    treated as non-fatal: the stream keeps whatever encoding it had, so a
+    best-effort guarantee rather than a hard failure.
+    """
+    try:
+        raw = stream_obj.get_data()
+    except Exception:
+        return
+
+    try:
+        # Clear the existing filter before swapping bytes so the reader
+        # never tries to decompress content that is now raw.
+        if "/Filter" in stream_obj:
+            del stream_obj["/Filter"]
+        stream_obj.set_data(raw)
+    except Exception:
+        return
+
+    if target_filter is not None:
+        try:
+            stream_obj[NameObject("/Filter")] = NameObject(target_filter)
+        except Exception:
+            pass
+
+
+def _apply_output_compression(writer: PdfWriter, mode: str) -> None:
+    """
+    Apply the requested compression strategy to every page content stream.
+
+    Only page ``/Contents`` streams are touched; embedded images and
+    fonts keep their original encoding so no pixel data is ever altered.
+    """
+    if mode == "preserve":
+        return
+
+    target_filter = "/FlateDecode" if mode == "deflate" else None
+
+    for page in writer.pages:
+        try:
+            contents = page.get_contents()
+        except Exception:
+            continue
+        if contents is None:
+            continue
+
+        if hasattr(contents, "get_data"):
+            streams = [contents]
+        else:
+            try:
+                streams = list(contents)
+            except TypeError:
+                continue
+
+        for stream_obj in streams:
+            _reencode_stream(stream_obj, target_filter)
+
+
+def _apply_metadata(
+    writer: PdfWriter, reader: PdfReader, settings: ComposerSettings
+) -> None:
+    """Copy document metadata from the source into the composed output."""
+    if not settings.preserve_metadata:
+        return
+    try:
+        source = reader.metadata
+    except Exception:
+        return
+    if not source:
+        return
+    try:
+        writer.add_metadata(dict(source))
+    except Exception:
+        # Metadata is best-effort; a malformed entry must not abort the run.
+        return
+
+
+def process_pdf_bytes(
+    pdf_bytes: bytes, stem: str, settings: ComposerSettings
+) -> ProcessedPdf:
     """
     Apply the full pipeline to ``pdf_bytes`` and return the composed PDF.
 
@@ -246,8 +623,10 @@ def process_pdf_bytes(pdf_bytes: bytes, stem: str) -> ProcessedPdf:
     if len(reader.pages) == 0:
         raise ValueError(ERR_ZERO_PAGES.format(name=stem))
 
-    interleaved = _interleave_and_rotate(reader.pages)
-    writer, n_sheets = _compose_2up(interleaved)
+    arranged = _arrange_pages(reader.pages, settings)
+    writer, n_sheets = _compose_sheets(arranged, settings)
+    _apply_metadata(writer, reader, settings)
+    _apply_output_compression(writer, settings.output_compression)
 
     buffer = io.BytesIO()
     writer.write(buffer)
@@ -346,14 +725,18 @@ async def _read_upload_capped(file: UploadFile) -> bytes:
 
 # ═════════════════════════════════ Batch orchestration ═══════════════════
 
-def _process_one(file: UploadFile, data: bytes) -> ProcessedPdf:
+def _process_one(
+    file: UploadFile, data: bytes, settings: ComposerSettings
+) -> ProcessedPdf:
     """Run the pipeline for a single validated upload."""
     stem = _safe_stem(file.filename)
-    return process_pdf_bytes(data, stem)
+    return process_pdf_bytes(data, stem, settings)
 
 
 def process_uploads(
-    files: Sequence[UploadFile], payloads: Sequence[bytes]
+    files: Sequence[UploadFile],
+    payloads: Sequence[bytes],
+    settings: ComposerSettings,
 ) -> BatchResult:
     """
     Process every upload, collecting per-file failures instead of aborting
@@ -364,14 +747,14 @@ def process_uploads(
 
     for file, data in zip(files, payloads):
         try:
-            processed.append(_process_one(file, data))
+            processed.append(_process_one(file, data, settings))
         except ValueError as exc:
             failures.append(f"{file.filename or '<unnamed>'}: {exc}")
 
     return BatchResult(files=tuple(processed), failures=tuple(failures))
 
 
-def _build_response(batch: BatchResult) -> Response:
+def _build_response(batch: BatchResult, settings: ComposerSettings) -> Response:
     """Return a single PDF, a ZIP of many, or a 422 when everything failed."""
     if not batch.files:
         detail = "; ".join(batch.failures) or ERR_NO_FILES
@@ -379,18 +762,27 @@ def _build_response(batch: BatchResult) -> Response:
             status_code=HTTP_422_UNPROCESSABLE, detail=detail
         )
 
+    common_headers = {
+        "X-Pages-Per-Sheet": str(settings.pages_per_sheet),
+        "X-Sheet-Size": settings.sheet_size,
+        "X-Sheet-Orientation": settings.sheet_orientation,
+        "X-Compression": settings.output_compression,
+    }
+
     if len(batch.files) == 1:
         only = batch.files[0]
+        headers = {
+            "Content-Disposition": (
+                f'attachment; filename="{only.output_name}"'
+            ),
+            "X-Input-Pages": str(only.input_pages),
+            "X-Output-Sheets": str(only.output_sheets),
+            **common_headers,
+        }
         return Response(
             content=only.content,
             media_type="application/pdf",
-            headers={
-                "Content-Disposition": (
-                    f'attachment; filename="{only.output_name}"'
-                ),
-                "X-Input-Pages": str(only.input_pages),
-                "X-Output-Sheets": str(only.output_sheets),
-            },
+            headers=headers,
         )
 
     stamp = datetime.now().strftime(f"{DATE_FORMAT}_{TIME_FORMAT}")
@@ -403,6 +795,7 @@ def _build_response(batch: BatchResult) -> Response:
     headers = {
         "Content-Disposition": f'attachment; filename="{zip_name}"',
         "X-File-Count": str(len(batch.files)),
+        **common_headers,
     }
     if batch.failures:
         # Surface partial-failure context without breaking the download.
@@ -418,11 +811,12 @@ def _build_response(batch: BatchResult) -> Response:
 # ═════════════════════════════════ FastAPI app ═══════════════════════════
 
 app = FastAPI(
-    title="PDF Interleave + Rotate + 2-Up Composer",
+    title="PDF Interleave + Rotate + N-Up Composer",
     description=(
-        "Interleave a PDF (A1,B1,A2,B2…), rotate every page 90° "
-        "counter-clockwise, and lay the result out as 2-up A4-landscape "
-        "sheets."
+        "Interleave a PDF, rotate every page (default 90° counter-"
+        "clockwise), and lay the result out as multi-up sheets with "
+        "configurable size, orientation, fit mode, margins and stream "
+        "compression."
     ),
     docs_url=None,
     redoc_url=None,
@@ -446,10 +840,22 @@ async def api_process(
     files: Annotated[
         list[UploadFile], File(description="One or more PDF files")
     ],
+    rotation: Annotated[str, Form()] = DEFAULT_ROTATION,
+    interleave: Annotated[str, Form()] = "true",
+    pages_per_sheet: Annotated[str, Form()] = str(DEFAULT_PAGES_PER_SHEET),
+    sheet_size: Annotated[str, Form()] = DEFAULT_SHEET_SIZE,
+    sheet_orientation: Annotated[str, Form()] = DEFAULT_ORIENTATION,
+    fit_mode: Annotated[str, Form()] = DEFAULT_FIT_MODE,
+    margin_mm: Annotated[str, Form()] = "0",
+    gutter_mm: Annotated[str, Form()] = "0",
+    allow_upscale: Annotated[str, Form()] = "false",
+    output_compression: Annotated[str, Form()] = DEFAULT_COMPRESSION,
+    preserve_metadata: Annotated[str, Form()] = "true",
 ) -> Response:
     """
-    Accept one or more PDF uploads, run the pipeline, and return either a
-    single PDF or a ZIP archive containing every result.
+    Accept one or more PDF uploads, run the pipeline using the supplied
+    settings, and return either a single PDF or a ZIP archive containing
+    every result.
     """
     if not files:
         raise HTTPException(
@@ -460,6 +866,22 @@ async def api_process(
             status_code=HTTP_413_TOO_LARGE, detail=ERR_TOO_MANY_FILES
         )
 
+    settings = build_settings(
+        {
+            "rotation": rotation,
+            "interleave": interleave,
+            "pages_per_sheet": pages_per_sheet,
+            "sheet_size": sheet_size,
+            "sheet_orientation": sheet_orientation,
+            "fit_mode": fit_mode,
+            "margin_mm": margin_mm,
+            "gutter_mm": gutter_mm,
+            "allow_upscale": allow_upscale,
+            "output_compression": output_compression,
+            "preserve_metadata": preserve_metadata,
+        }
+    )
+
     payloads: list[bytes] = []
     for file in files:
         data = await _read_upload_capped(file)
@@ -468,8 +890,10 @@ async def api_process(
 
     # pypdf is CPU-bound and synchronous; offload so the event loop stays
     # free to serve other requests.
-    batch = await run_in_threadpool(process_uploads, files, payloads)
-    return _build_response(batch)
+    batch = await run_in_threadpool(
+        process_uploads, files, payloads, settings
+    )
+    return _build_response(batch, settings)
 
 
 # ═════════════════════════════════ Presentation ══════════════════════════
@@ -479,7 +903,7 @@ INDEX_HTML: Final[str] = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>PDF Composer — Interleave · Rotate · 2-Up A4</title>
+<title>PDF Composer — Interleave · Rotate · N-Up</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
   tailwind.config = {
@@ -512,6 +936,19 @@ INDEX_HTML: Final[str] = r"""<!DOCTYPE html>
   @keyframes sh { to { background-position: -200% 0; } }
   ::-webkit-scrollbar{width:10px;height:10px}
   ::-webkit-scrollbar-thumb{background:#1f2b3a;border-radius:8px}
+
+  /* Advanced settings panel styling */
+  details.adv > summary { list-style: none; }
+  details.adv > summary::-webkit-details-marker { display: none; }
+  details.adv[open] > summary .chev { transform: rotate(90deg); }
+  .chev { transition: transform .15s ease; }
+  .field-label { font-size: .75rem; letter-spacing: .02em; text-transform: uppercase; }
+  .field-input {
+    background: rgba(11,15,20,.75); border: 1px solid #1f2b3a; color: #d7e1ea;
+    border-radius: .5rem; padding: .45rem .65rem; font-size: .85rem; width: 100%;
+  }
+  .field-input:focus { outline: 2px solid #22d3ee; outline-offset: 0; border-color:#22d3ee; }
+  .chk { accent-color: #22d3ee; }
 </style>
 </head>
 <body class="min-h-screen font-sans text-steel-200 antialiased">
@@ -528,10 +965,11 @@ INDEX_HTML: Final[str] = r"""<!DOCTYPE html>
       <h1 class="text-2xl sm:text-3xl font-semibold tracking-tight text-white">PDF Composer</h1>
     </div>
     <p class="text-sm text-steel-400 max-w-2xl leading-relaxed">
-      Interleave <span class="font-mono text-steel-300">A1,B1,A2,B2…</span> ·
-      Rotate <span class="font-mono text-steel-300">90° left</span> ·
-      Compose <span class="font-mono text-steel-300">2-up A4 landscape</span>.
+      Interleave · Rotate · N-Up compose in one pass.
       Everything runs in-memory; nothing is written to the server's disk.
+      Embedded images and fonts are preserved byte-for-byte — the
+      <span class="font-mono text-steel-300">output&nbsp;compression</span>
+      setting only affects page content streams.
     </p>
   </header>
 
@@ -550,6 +988,113 @@ INDEX_HTML: Final[str] = r"""<!DOCTYPE html>
     </div>
 
     <div id="fileList" class="mt-5 space-y-2 hidden"></div>
+
+    <!-- ── Advanced settings ──────────────────────────────────────────── -->
+    <details class="adv mt-5 rounded-xl border border-ink-600 bg-ink-800/60 overflow-hidden">
+      <summary class="cursor-pointer select-none flex items-center gap-2 px-4 py-3 text-sm font-medium text-steel-300 hover:text-white transition-colors">
+        <svg class="chev w-3.5 h-3.5 text-signal-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+          <path d="m9 6 6 6-6 6"/>
+        </svg>
+        Advanced Settings
+        <span class="ml-auto text-xs text-steel-400 font-normal">rotation · layout · quality</span>
+      </summary>
+
+      <div class="border-t border-ink-600 px-4 py-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+
+        <!-- Rotation -->
+        <label class="block">
+          <span class="field-label text-steel-400 block mb-1">Rotation</span>
+          <select id="optRotation" class="field-input">
+            <option value="left" selected>90° Left (CCW)</option>
+            <option value="right">90° Right (CW)</option>
+            <option value="180">180°</option>
+            <option value="none">None</option>
+          </select>
+        </label>
+
+        <!-- Pages per sheet -->
+        <label class="block">
+          <span class="field-label text-steel-400 block mb-1">Pages per sheet</span>
+          <select id="optPagesPerSheet" class="field-input">
+            <option value="2" selected>2 (2-up)</option>
+            <option value="1">1 (single)</option>
+            <option value="4">4 (2×2 grid)</option>
+          </select>
+        </label>
+
+        <!-- Sheet size -->
+        <label class="block">
+          <span class="field-label text-steel-400 block mb-1">Sheet size</span>
+          <select id="optSheetSize" class="field-input">
+            <option value="A4" selected>A4</option>
+            <option value="A3">A3</option>
+            <option value="A5">A5</option>
+            <option value="LETTER">Letter</option>
+            <option value="LEGAL">Legal</option>
+            <option value="TABLOID">Tabloid</option>
+          </select>
+        </label>
+
+        <!-- Orientation -->
+        <label class="block">
+          <span class="field-label text-steel-400 block mb-1">Orientation</span>
+          <select id="optOrientation" class="field-input">
+            <option value="landscape" selected>Landscape</option>
+            <option value="portrait">Portrait</option>
+            <option value="auto">Auto</option>
+          </select>
+        </label>
+
+        <!-- Fit mode -->
+        <label class="block">
+          <span class="field-label text-steel-400 block mb-1">Fit mode</span>
+          <select id="optFitMode" class="field-input">
+            <option value="fit" selected>Fit (aspect-preserving)</option>
+            <option value="stretch">Stretch to fill slot</option>
+            <option value="actual">Actual size (no scaling)</option>
+          </select>
+        </label>
+
+        <!-- Output compression -->
+        <label class="block">
+          <span class="field-label text-steel-400 block mb-1">Output compression</span>
+          <select id="optCompression" class="field-input">
+            <option value="preserve" selected>Preserve original</option>
+            <option value="deflate">Deflate (lossless, smaller)</option>
+            <option value="none">None (uncompressed, largest)</option>
+          </select>
+        </label>
+
+        <!-- Margin -->
+        <label class="block">
+          <span class="field-label text-steel-400 block mb-1">Margin (mm)</span>
+          <input id="optMargin" type="number" min="0" max="25" step="0.5" value="0" class="field-input" />
+        </label>
+
+        <!-- Gutter -->
+        <label class="block">
+          <span class="field-label text-steel-400 block mb-1">Gutter between slots (mm)</span>
+          <input id="optGutter" type="number" min="0" max="25" step="0.5" value="0" class="field-input" />
+        </label>
+
+        <!-- Toggles -->
+        <div class="space-y-3 pt-2 sm:pt-0">
+          <label class="flex items-center gap-2 text-sm text-steel-300">
+            <input id="optInterleave" type="checkbox" checked class="chk w-4 h-4" />
+            Duplicate pages (interleave)
+          </label>
+          <label class="flex items-center gap-2 text-sm text-steel-300">
+            <input id="optAllowUpscale" type="checkbox" class="chk w-4 h-4" />
+            Allow upscaling (may blur)
+          </label>
+          <label class="flex items-center gap-2 text-sm text-steel-300">
+            <input id="optPreserveMeta" type="checkbox" checked class="chk w-4 h-4" />
+            Preserve metadata
+          </label>
+        </div>
+
+      </div>
+    </details>
 
     <div class="mt-6 flex flex-col sm:flex-row gap-3">
       <button id="processBtn" disabled
@@ -601,7 +1146,7 @@ INDEX_HTML: Final[str] = r"""<!DOCTYPE html>
     return (n / (1024 * 1024)).toFixed(1) + ' MB';
   };
 
-  const escapeHtml = (s) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;')
+  const escapeHtml = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
                               .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
   function renderList() {
@@ -659,7 +1204,27 @@ INDEX_HTML: Final[str] = r"""<!DOCTYPE html>
   dropzone.addEventListener('click', () => fileInput.click());
   fileInput.addEventListener('change', () => { addFiles(fileInput.files); fileInput.value = ''; });
 
-  clearBtn.addEventListener('click', () => { selected = []; renderList(); statusPanel.classList.add('hidden'); });
+  clearBtn.addEventListener('click', () => {
+    selected = [];
+    renderList();
+    statusPanel.classList.add('hidden');
+  });
+
+  // ── Advanced settings collection ───────────────────────────────────────
+  function collectSettings(form) {
+    const val = (id) => document.getElementById(id);
+    form.append('rotation',            val('optRotation').value);
+    form.append('pages_per_sheet',     val('optPagesPerSheet').value);
+    form.append('sheet_size',          val('optSheetSize').value);
+    form.append('sheet_orientation',   val('optOrientation').value);
+    form.append('fit_mode',            val('optFitMode').value);
+    form.append('output_compression',  val('optCompression').value);
+    form.append('margin_mm',           String(val('optMargin').value || '0'));
+    form.append('gutter_mm',           String(val('optGutter').value || '0'));
+    form.append('interleave',          val('optInterleave').checked ? 'true' : 'false');
+    form.append('allow_upscale',       val('optAllowUpscale').checked ? 'true' : 'false');
+    form.append('preserve_metadata',   val('optPreserveMeta').checked ? 'true' : 'false');
+  }
 
   // ── Process ────────────────────────────────────────────────────────────
   processBtn.addEventListener('click', async () => {
@@ -676,6 +1241,7 @@ INDEX_HTML: Final[str] = r"""<!DOCTYPE html>
 
     const form = new FormData();
     selected.forEach(f => form.append('files', f, f.name));
+    collectSettings(form);
 
     try {
       const res = await fetch('/api/process', { method: 'POST', body: form });
@@ -696,12 +1262,18 @@ INDEX_HTML: Final[str] = r"""<!DOCTYPE html>
       setTimeout(() => URL.revokeObjectURL(url), 4000);
 
       const failed = res.headers.get('X-Failed-Count');
+      const pps = res.headers.get('X-Pages-Per-Sheet') || '';
+      const size = res.headers.get('X-Sheet-Size') || '';
+      const comp = res.headers.get('X-Compression') || '';
+      const summary = [pps && pps + '-up', size, comp].filter(Boolean).join(' · ');
+
       statusBody.innerHTML =
         '<div class="flex items-start gap-3">' +
           '<svg class="w-5 h-5 mt-0.5 text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
             '<path d="M20 6 9 17l-5-5"/></svg>' +
           '<div><p class="text-white font-medium">Download started</p>' +
           '<p class="text-steel-400 mt-1">' + escapeHtml(outName) +
+          (summary ? ' · ' + escapeHtml(summary) : '') +
           (failed ? ' · ' + failed + ' file(s) failed' : '') + '</p></div>' +
         '</div>';
     } catch (err) {
